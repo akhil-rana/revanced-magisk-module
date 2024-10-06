@@ -1,10 +1,10 @@
-Music-Extended (arm64-v8a): 7.16.53  
 Music (arm-v7a): 7.21.50  
+Music-Extended (arm64-v8a): 7.16.53  
 Music (arm64-v8a): 7.21.50  
-Twitter: 10.61.1-release.0  
+Music-Extended (arm-v7a): 7.16.53  
 YouTube: 19.16.39  
 YouTube-Extended: 19.16.39  
-Music-Extended (arm-v7a): 7.16.53  
+Twitter: 10.61.1-release.0  
 Twitch: 16.9.1  
 Reddit-Extended: 2024.17.0  
 TikTok: 36.5.4  
