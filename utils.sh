@@ -5,6 +5,7 @@ CWD=$(pwd)
 TEMP_DIR="temp"
 BIN_DIR="bin"
 BUILD_DIR="build"
+PATCH_EXT=""
 
 if [ "${GITHUB_TOKEN-}" ]; then GH_HEADER="Authorization: token ${GITHUB_TOKEN}"; else GH_HEADER=; fi
 NEXT_VER_CODE=${NEXT_VER_CODE:-$(date +'%Y%m%d')}
@@ -38,30 +39,37 @@ toml_get() {
 pr() { echo -e "\033[0;32m[+] ${1}\033[0m"; }
 epr() {
 	echo >&2 -e "\033[0;31m[-] ${1}\033[0m"
-	if [ "${GITHUB_REPOSITORY-}" ]; then echo -e "::error::utils.sh [-] ${1}\n"; fi
+	if [ "${GITHUB_REPOSITORY-}" ]; then echo >&2 -e "::error::utils.sh [-] ${1}\n"; fi
+}
+wpr() {
+	echo >&2 -e "\033[0;33m[!] ${1}\033[0m"
+	if [ "${GITHUB_REPOSITORY-}" ]; then echo >&2 -e "::warning::utils.sh [!] ${1}\n"; fi
 }
 abort() {
 	epr "ABORT: ${1-}"
 	exit 1
 }
 
-get_rv_prebuilts() {
+get_prebuilts() {
 	local cli_src=$1 cli_ver=$2 patches_src=$3 patches_ver=$4
 	pr "Getting prebuilts (${patches_src%/*})" >&2
 	local cl_dir=${patches_src%/*}
 	cl_dir=${TEMP_DIR}/${cl_dir,,}-rv
 	[ -d "$cl_dir" ] || mkdir "$cl_dir"
+
 	for src_ver in "$cli_src CLI $cli_ver revanced-cli" "$patches_src Patches $patches_ver patches"; do
 		set -- $src_ver
 		local src=$1 tag=$2 ver=${3-} fprefix=$4
 		local ext
+
 		if [ "$tag" = "CLI" ]; then
 			ext="jar"
 			local grab_cl=false
 		elif [ "$tag" = "Patches" ]; then
-			ext="rvp"
+			ext=$PATCH_EXT
 			local grab_cl=true
 		else abort unreachable; fi
+
 		local dir=${src%/*}
 		dir=${TEMP_DIR}/${dir,,}-rv
 		[ -d "$dir" ] || mkdir "$dir"
@@ -86,7 +94,11 @@ get_rv_prebuilts() {
 			local resp asset name
 			resp=$(gh_req "$rv_rel" -) || return 1
 			tag_name=$(jq -r '.tag_name' <<<"$resp")
-			asset=$(jq -e -r ".assets[] | select(.name | endswith(\"$ext\"))" <<<"$resp") || return 1
+			matches=$(jq -e ".assets | map(select(.name | endswith(\"$ext\")))" <<<"$resp")
+			if [ "$(jq 'length' <<<"$matches")" -ne 1 ]; then
+				wpr "More than 1 asset was found for this cli release. Falling back to the first one found..."
+			fi
+			asset=$(jq -r ".[0]" <<<"$matches")
 			url=$(jq -r .url <<<"$asset")
 			name=$(jq -r .name <<<"$asset")
 			file="${dir}/${name}"
@@ -103,14 +115,20 @@ get_rv_prebuilts() {
 			tag_name=$(cut -d'-' -f3- <<<"$name")
 			tag_name=v${tag_name%.*}
 		fi
-		if [ "$tag" = "Patches" ]; then
+
+		if [ "$tag" = "CLI" ]; then
+			PATCH_EXT=$(java -jar "$file" -h | grep -oP -m1 '\w+(?= files)' | tr '[:upper:]' '[:lower:]')
+			if [ -z "$PATCH_EXT" ]; then abort "Unable to detect patch extension from CLI help output."; fi
+		elif [ "$tag" = "Patches" ]; then
 			if [ $grab_cl = true ]; then echo -e "[Changelog](https://github.com/${src}/releases/tag/${tag_name})\n" >>"${cl_dir}/changelog.md"; fi
 			if [ "$REMOVE_RV_INTEGRATIONS_CHECKS" = true ]; then
+				# inner extension (rvp->rve, mpp->mpe)
+				local inner_ext="${ext%p}e"
 				if ! (
 					mkdir -p "${file}-zip" || return 1
 					unzip -qo "${file}" -d "${file}-zip" || return 1
-					java -cp "${BIN_DIR}/paccer.jar:${BIN_DIR}/dexlib2.jar" com.jhc.Main "${file}-zip/extensions/shared.rve" "${file}-zip/extensions/shared-patched.rve" || return 1
-					mv -f "${file}-zip/extensions/shared-patched.rve" "${file}-zip/extensions/shared.rve" || return 1
+					java -cp "${BIN_DIR}/paccer.jar:${BIN_DIR}/dexlib2.jar" com.jhc.Main "${file}-zip/extensions/shared.${inner_ext}" "${file}-zip/extensions/shared-patched.${inner_ext}" || return 1
+					mv -f "${file}-zip/extensions/shared-patched.${inner_ext}" "${file}-zip/extensions/shared.${inner_ext}" || return 1
 					rm "${file}" || return 1
 					cd "${file}-zip" || abort
 					zip -0rq "${CWD}/${file}" . || return 1
@@ -160,7 +178,7 @@ config_update() {
 			else
 				last_patches=$(gh_req "$rv_rel/tags/${ver}" -)
 			fi
-			if ! last_patches=$(jq -e -r '.assets[] | select(.name | endswith("rvp")) | .name' <<<"$last_patches"); then
+			if ! last_patches=$(jq -e -r ".assets[] | select(.name | endswith(\"$PATCH_EXT\")) | .name" <<<"$last_patches"); then
 				abort oops
 			fi
 			if [ "$last_patches" ]; then
@@ -249,13 +267,13 @@ get_patch_last_supported_ver() {
 			return
 		fi
 	fi
-	if ! op=$(java -jar "$rv_cli_jar" list-versions "$rv_patches_jar" -f "$pkg_name" 2>&1 | tail -n +3 | awk '{$1=$1}1'); then
-		epr "list-versions: '$op'"
-		return 1
-	fi
+	op=$(java -jar "$cli_jar" list-versions "$patches_jar" -f "$pkg_name" 2>&1 | tail -n +3 | awk '{$1=$1}1')
 	if [ "$op" = "Any" ]; then return; fi
 	pcount=$(head -1 <<<"$op") pcount=${pcount#*(} pcount=${pcount% *}
-	if [ -z "$pcount" ]; then abort "unreachable: '$pcount'"; fi
+	if [ -z "$pcount" ]; then
+		av_apps=$(java -jar "$cli_jar" list-versions "$patches_jar" 2>&1 | awk '/Package name:/ { printf "%s\x27%s\x27", sep, $NF; sep=", " } END { print "" }')
+		abort "No patch versions found for '$pkg_name' in this patches source!\nAvailable applications found: $av_apps"
+	fi
 	grep -F "($pcount patch" <<<"$op" | sed 's/ (.* patch.*//' | get_highest_ver || return 1
 }
 
@@ -372,8 +390,8 @@ get_apkmirror_resp() {
 
 # -------------------- uptodown --------------------
 get_uptodown_resp() {
-	__UPTODOWN_RESP__=$(req "${1}/versions" -)
-	__UPTODOWN_RESP_PKG__=$(req "${1}/download" -)
+	__UPTODOWN_RESP__=$(req "${1}/versions" -) || return 1
+	__UPTODOWN_RESP_PKG__=$(req "${1}/download" -) || return 1
 }
 get_uptodown_vers() { $HTMLQ --text ".version" <<<"$__UPTODOWN_RESP__"; }
 dl_uptodown() {
@@ -381,14 +399,14 @@ dl_uptodown() {
 	local apparch
 	if [ "$arch" = "arm-v7a" ]; then arch="armeabi-v7a"; fi
 	if [ "$arch" = all ]; then
-		apparch=('arm64-v8a, armeabi-v7a, x86, x86_64' 'arm64-v8a, armeabi-v7a')
-	else apparch=("$arch" 'arm64-v8a, armeabi-v7a, x86, x86_64' 'arm64-v8a, armeabi-v7a'); fi
+		apparch=('arm64-v8a, armeabi-v7a, x86_64' 'arm64-v8a, armeabi-v7a, x86, x86_64' 'arm64-v8a, armeabi-v7a')
+	else apparch=("$arch" 'arm64-v8a, armeabi-v7a, x86_64' 'arm64-v8a, armeabi-v7a, x86, x86_64' 'arm64-v8a, armeabi-v7a'); fi
 
 	local op resp data_code
 	data_code=$($HTMLQ "#detail-app-name" --attribute data-code <<<"$__UPTODOWN_RESP__")
 	local versionURL=""
 	local is_bundle=false
-	for i in {1..5}; do
+	for i in {1..20}; do
 		resp=$(req "${uptodown_dlurl}/apps/${data_code}/versions/${i}" -)
 		if ! op=$(jq -e -r ".data | map(select(.version == \"${version}\")) | .[0]" <<<"$resp"); then
 			continue
@@ -400,18 +418,26 @@ dl_uptodown() {
 	versionURL=$(jq -e -r '.url + "/" + .extraURL + "/" + (.versionID | tostring)' <<<"$versionURL")
 	resp=$(req "$versionURL" -) || return 1
 
-	local data_version files node_arch data_file_id
+	local data_version files node_arch="" data_file_id node_class
 	data_version=$($HTMLQ '.button.variants' --attribute data-version <<<"$resp") || return 1
 	if [ "$data_version" ]; then
 		files=$(req "${uptodown_dlurl%/*}/app/${data_code}/version/${data_version}/files" - | jq -e -r .content) || return 1
-		for ((n = 1; n < 12; n += 2)); do
-			node_arch=$($HTMLQ ".content > p:nth-child($n)" --text <<<"$files" | xargs) || return 1
+		for ((n = 1; n < 12; n += 1)); do
+			node_class=$($HTMLQ -w -t ".content > :nth-child($n)" --attribute class <<<"$files") || return 1
+			if [ "$node_class" != "variant" ]; then
+				node_arch=$($HTMLQ -w -t ".content > :nth-child($n)" <<<"$files" | xargs) || return 1
+				continue
+			fi
 			if [ -z "$node_arch" ]; then return 1; fi
 			if ! isoneof "$node_arch" "${apparch[@]}"; then continue; fi
-			data_file_id=$($HTMLQ "div.variant:nth-child($((n + 1))) > .v-report" --attribute data-file-id <<<"$files") || return 1
+
+			file_type=$($HTMLQ -w -t ".content > :nth-child($n) > .v-file > span" <<<"$files") || return 1
+			if [ "$file_type" = "xapk" ]; then is_bundle=true; else is_bundle=false; fi
+			data_file_id=$($HTMLQ ".content > :nth-child($n) > .v-report" --attribute data-file-id <<<"$files") || return 1
 			resp=$(req "${uptodown_dlurl}/download/${data_file_id}-x" -)
 			break
 		done
+		if [ $n -eq 12 ]; then return 1; fi
 	fi
 	local data_url
 	data_url=$($HTMLQ "#detail-download-button" --attribute data-url <<<"$resp") || return 1
@@ -442,10 +468,10 @@ get_archive_pkg_name() { echo "$__ARCHIVE_PKG_NAME__"; }
 # --------------------------------------------------
 
 patch_apk() {
-	local stock_input=$1 patched_apk=$2 patcher_args=$3 rv_cli_jar=$4 rv_patches_jar=$5
-	local cmd="env -u GITHUB_REPOSITORY java -jar $rv_cli_jar patch $stock_input --purge -o $patched_apk -p $rv_patches_jar --keystore=ks.keystore \
+	local stock_input=$1 patched_apk=$2 patcher_args=$3 cli_jar=$4 patches_jar=$5
+	local cmd="env -u GITHUB_REPOSITORY java -jar '$cli_jar' patch '$stock_input' --purge -o '$patched_apk' -p '$patches_jar' --keystore=ks.keystore \
 --keystore-entry-password=123456789 --keystore-password=123456789 --signer=jhc --keystore-entry-alias=jhc $patcher_args"
-	if [ "$OS" = Android ]; then cmd+=" --custom-aapt2-binary=${AAPT2}"; fi
+	if [ "$OS" = Android ]; then cmd+=" --custom-aapt2-binary='${AAPT2}'"; fi
 	pr "$cmd"
 	if eval "$cmd"; then [ -f "$patched_apk" ]; else
 		rm "$patched_apk" 2>/dev/null || :
@@ -457,7 +483,7 @@ check_sig() {
 	local file=$1 pkg_name=$2
 	local sig
 	if grep -q "$pkg_name" sig.txt; then
-		sig=$(java -jar "$APKSIGNER" verify --print-certs "$file" | grep ^Signer | grep SHA-256 | tail -1 | awk '{print $NF}')
+		sig=$(java -jar --enable-native-access=ALL-UNNAMED "$APKSIGNER" verify --print-certs "$file" | grep ^Signer | grep SHA-256 | tail -1 | awk '{print $NF}')
 		echo "$pkg_name signature: ${sig}"
 		grep -qFx "$sig $pkg_name" sig.txt
 	fi
@@ -497,7 +523,7 @@ build_rv() {
 		return 0
 	fi
 	local list_patches
-	list_patches=$(java -jar "$rv_cli_jar" list-patches "$rv_patches_jar" -f "$pkg_name" -v -p 2>&1)
+	list_patches=$(java -jar "$cli_jar" list-patches "$patches_jar" -f "$pkg_name" -v -p 2>&1)
 
 	local get_latest_ver=false
 	if [ "$version_mode" = auto ]; then
@@ -537,17 +563,22 @@ build_rv() {
 	if [ ! -f "$stock_apk" ]; then
 		for dl_p in archive apkmirror uptodown; do
 			if [ -z "${args[${dl_p}_dlurl]}" ]; then continue; fi
-			pr "Downloading '${table}' from ${dl_p}"
-			if ! isoneof $dl_p "${tried_dl[@]}"; then get_${dl_p}_resp "${args[${dl_p}_dlurl]}"; fi
+			pr "Downloading '${table}' from '${dl_p}'"
+			if ! isoneof $dl_p "${tried_dl[@]}"; then
+				if ! get_${dl_p}_resp "${args[${dl_p}_dlurl]}"; then
+					epr "ERROR: Could not get '${table}' from '${dl_p}'"
+					continue
+				fi
+			fi
 			if ! dl_${dl_p} "${args[${dl_p}_dlurl]}" "$version" "$stock_apk" "$arch" "${args[dpi]}" "$get_latest_ver"; then
-				epr "ERROR: Could not download '${table}' from ${dl_p} with version '${version}', arch '${arch}', dpi '${args[dpi]}'"
+				epr "ERROR: Could not download '${table}' from '${dl_p}' with version '${version}', arch '${arch}', dpi '${args[dpi]}'"
 				continue
 			fi
 			break
 		done
 		if [ ! -f "$stock_apk" ]; then return 0; fi
 	fi
-	if ! OP=$(check_sig "$stock_apk" "$pkg_name" 2>&1) && ! grep -qFx "ERROR: Missing META-INF/MANIFEST.MF" <<<"$OP"; then
+	if [ ! -f "${stock_apk}.apkm" ] && ! OP=$(check_sig "$stock_apk" "$pkg_name" 2>&1) && ! grep -qFx "ERROR: Missing META-INF/MANIFEST.MF" <<<"$OP"; then
 		epr "$pkg_name not building, apk signature mismatch '$stock_apk': $OP"
 		return 0
 	fi
@@ -560,10 +591,10 @@ build_rv() {
 		p_patcher_args=("${p_patcher_args[@]//-[ei] ${microg_patch}/}")
 	fi
 
-	local spoof_client_patch
-	spoof_client_patch=$(grep "^Name: " <<<"$list_patches" | grep -i "Spoof Client" || :) spoof_client_patch=${spoof_client_patch#*: }
-	local spoof_video_patch
-	spoof_video_patch=$(grep "^Name: " <<<"$list_patches" | grep -i "Spoof Video" || :) spoof_video_patch=${spoof_video_patch#*: }
+	# local spoof_client_patch
+	# spoof_client_patch=$(grep "^Name: " <<<"$list_patches" | grep -i "Spoof Client" || :) spoof_client_patch=${spoof_client_patch#*: }
+	# local spoof_video_patch
+	# spoof_video_patch=$(grep "^Name: " <<<"$list_patches" | grep -i "Spoof Video" || :) spoof_video_patch=${spoof_video_patch#*: }
 
 	local patcher_args patched_apk build_mode
 	local rv_brand_f=${args[rv_brand],,}
@@ -584,12 +615,12 @@ build_rv() {
 				patcher_args+=("-d \"${microg_patch}\"")
 			fi
 		fi
-		if [ -n "$spoof_client_patch" ] && [[ ! ${p_patcher_args[*]} =~ $spoof_client_patch ]] && [ "$build_mode" = module ]; then
-			patcher_args+=("-d \"${spoof_client_patch}\"")
-		fi
-		if [ -n "$spoof_video_patch" ] && [[ ! ${p_patcher_args[*]} =~ $spoof_video_patch ]] && [ "$build_mode" = module ]; then
-			patcher_args+=("-d \"${spoof_video_patch}\"")
-		fi
+		# if [ -n "$spoof_client_patch" ] && [[ ! ${p_patcher_args[*]} =~ $spoof_client_patch ]] && [ "$build_mode" = module ]; then
+		# 	patcher_args+=("-d \"${spoof_client_patch}\"")
+		# fi
+		# if [ -n "$spoof_video_patch" ] && [[ ! ${p_patcher_args[*]} =~ $spoof_video_patch ]] && [ "$build_mode" = module ]; then
+		# 	patcher_args+=("-d \"${spoof_video_patch}\"")
+		# fi
 		if [ "${args[riplib]}" = true ]; then
 			patcher_args+=("--rip-lib x86_64 --rip-lib x86")
 			if [ "$build_mode" = module ]; then
@@ -621,11 +652,11 @@ build_rv() {
 
 		module_config "$base_template" "$pkg_name" "$version" "$arch"
 
-		local rv_patches_ver="${rv_patches_jar##*-}"
+		local patches_ver="${patches_jar##*-}"
 		module_prop \
 			"${args[module_prop_name]}" \
 			"${app_name} ${args[rv_brand]}" \
-			"${version} (patches ${rv_patches_ver%%.rvp})" \
+			"${version} (patches ${patches_ver%%.$PATCH_EXT})" \
 			"${app_name} ${args[rv_brand]} Magisk module" \
 			"https://raw.githubusercontent.com/${GITHUB_REPOSITORY-}/update/${upj}" \
 			"$base_template"
